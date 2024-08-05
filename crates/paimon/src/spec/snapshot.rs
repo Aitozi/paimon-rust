@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
+use crate::io::FileIO;
 
 /// Snapshot for paimon.
 ///
@@ -133,5 +134,18 @@ impl Snapshot {
     #[inline]
     pub fn statistics(&self) -> Option<&str> {
         self.statistics.as_deref()
+    }
+}
+
+impl Snapshot {
+    pub fn from_path(file_io: &FileIO, path: &str) -> Snapshot {
+        todo!()
+    }
+
+    pub fn time_millis(&self) -> u64 {
+        SnapshotBuilder::id(self.id)
+            ::
+            .build()
+        self.time_millis()
     }
 }
