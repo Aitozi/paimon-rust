@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use crate::io::FileIO;
 use crate::spec::Snapshot;
+use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotManager {
@@ -95,13 +96,8 @@ impl SnapshotManager {
         Some(latest_id)
     }
 
-    pub fn earlier_than_time_mills(&self, timestamp_mills: u64, start_from_changelog: bool) -> Option<u64> {
-        let earliest_snapshot = self.earliest_snapshot_id()?;
-        let earliest = if start_from_changelog {
-            self.earliest_long_lived_changelog_id().unwrap_or(earliest_snapshot)
-        } else {
-            earliest_snapshot
-        };
+    pub fn earlier_than_time_mills(&self, timestamp_mills: u64) -> Option<u64> {
+        let earliest = self.earliest_snapshot_id()?;
         let latest = self.latest_snapshot_id()?;
         if self.changelog_or_snapshot(earliest).time_millis() >= timestamp_mills {
             return Some(earliest - 1);
@@ -145,76 +141,27 @@ impl SnapshotManager {
         final_snapshot
     }
 
-    pub fn later_or_equal_watermark(&self, watermark: u64) -> Option<Snapshot> {
-        let earliest = self.earliest_snapshot_id()?;
-        let latest = self.latest_snapshot_id()?;
-        if self.snapshot(latest).watermark() == u64::MIN {
-            return None;
-        }
-        let mut earliest_watermark = self.snapshot(earliest).watermark();
-        if earliest_watermark == u64::MIN {
-            for id in earliest..=latest {
-                earliest_watermark = self.snapshot(id).watermark();
-                if earliest_watermark != u64::MIN {
-                    break;
-                }
+    pub async fn snapshot_count(&self) -> Result<u64> {
+        let result = self.file_io.list_status(self.snapshot_directory().as_str()).await;
+        match result {
+            Ok(res) => {
+                Ok(res.len() as u64)
             }
-        }
-        if earliest_watermark >= watermark {
-            return Some(self.snapshot(earliest));
-        }
-        let mut low = earliest;
-        let mut high = latest;
-        let mut final_snapshot = None;
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            let snapshot = self.snapshot(mid);
-            let commit_watermark = snapshot.watermark();
-            if commit_watermark == u64::MIN {
-                for id in (low..=mid).rev() {
-                    let snapshot = self.snapshot(id);
-                    let commit_watermark = snapshot.watermark();
-                    if commit_watermark != u64::MIN {
-                        break;
-                    }
-                }
+            Err(e) => {
+                Err(Error::IoUnexpected {
+                    message: format!("Failed to list snapshot count: {:?}", e),
+                    source: e,
+                })
             }
-            if commit_watermark > watermark {
-                high = mid - 1;
-                final_snapshot = Some(snapshot);
-            } else if commit_watermark < watermark {
-                low = mid + 1;
-            } else {
-                final_snapshot = Some(snapshot);
-                break;
-            }
-        }
-        final_snapshot
-    }
-
-    pub fn snapshot_count(&self) -> io::Result<u64> {
-        Ok(fs::read_dir(self.snapshot_directory())?.count() as u64)
     }
 
     pub fn snapshots(&self) -> io::Result<Vec<Snapshot>> {
         let mut snapshots = Vec::new();
-        for entry in fs::read_dir(self.snapshot_directory())? {
-            let entry = entry?;
+        for entry in self.file_io.list_status(self.snapshot_directory().as_str())? {
             let path = entry.path();
             if path.is_file() && path.file_name().unwrap().to_str().unwrap().starts_with("snapshot-") {
                 snapshots.push(Snapshot::from_path(&self.file_io, &path));
             }
-        }
-        snapshots.sort_by_key(|s| s.id());
-        Ok(snapshots)
-    }
-
-    pub fn snapshots_within_range(&self, max_snapshot_id: Option<u64>, min_snapshot_id: Option<u64>) -> io::Result<Vec<Snapshot>> {
-        let mut snapshots = Vec::new();
-        let lower_bound = min_snapshot_id.unwrap_or_else(|| self.earliest_snapshot_id().unwrap());
-        let upper_bound = max_snapshot_id.unwrap_or_else(|| self.latest_snapshot_id().unwrap());
-        for id in lower_bound..=upper_bound {
-            snapshots.push(self.snapshot(id));
         }
         snapshots.sort_by_key(|s| s.id());
         Ok(snapshots)
@@ -273,42 +220,6 @@ impl SnapshotManager {
         None
     }
 
-    pub fn find_snapshots_for_identifiers(&self, user: &str, identifiers: &[u64]) -> Vec<Snapshot> {
-        if identifiers.is_empty() {
-            return Vec::new();
-        }
-        let latest_id = self.latest_snapshot_id()?;
-        let earliest_id = self.earliest_snapshot_id()?;
-        let min_searched_identifier = *identifiers.iter().min().unwrap();
-        let mut matched_snapshots = Vec::new();
-        let mut remaining_identifiers: HashSet<u64> = identifiers.iter().cloned().collect();
-        for id in (earliest_id..=latest_id).rev() {
-            let snapshot = self.snapshot(id);
-            if snapshot.commit_user() == user && remaining_identifiers.remove(&snapshot.commit_identifier()) {
-                matched_snapshots.push(snapshot);
-                if snapshot.commit_identifier() <= min_searched_identifier {
-                    break;
-                }
-            }
-        }
-        matched_snapshots
-    }
-
-    pub fn traversal_snapshots_from_latest_safely<F>(&self, checker: F) -> Option<Snapshot>
-    where
-        F: Fn(&Snapshot) -> bool,
-    {
-        let latest_id = self.latest_snapshot_id()?;
-        let earliest_id = self.earliest_snapshot_id()?;
-        for id in (earliest_id..=latest_id).rev() {
-            let snapshot = self.snapshot(id);
-            if checker(&snapshot) {
-                return Some(snapshot);
-            }
-        }
-        None
-    }
-
     fn find_latest(&self, dir: &str, prefix: &str) -> Option<i64> {
         self.read_hint("LATEST", dir).or_else(|| self.find_by_list_files(u64::max, dir, prefix))
     }
@@ -333,7 +244,7 @@ impl SnapshotManager {
         None
     }
 
-    fn find_by_list_files<F>(&self, reducer: F, dir: &Path, prefix: &str) -> Option<u64>
+    fn find_by_list_files<F>(&self, reducer: F, dir: &str, prefix: &str) -> Option<u64>
     where
         F: Fn(u64, u64) -> u64,
     {

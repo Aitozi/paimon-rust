@@ -135,17 +135,14 @@ impl Snapshot {
     pub fn statistics(&self) -> Option<&str> {
         self.statistics.as_deref()
     }
-}
 
-impl Snapshot {
-    pub fn from_path(file_io: &FileIO, path: &str) -> Snapshot {
+    /// Get the time in milliseconds of this snapshot.
+    #[inline]
+    pub fn time_millis(&self) -> u64 {
         todo!()
     }
 
-    pub fn time_millis(&self) -> u64 {
-        SnapshotBuilder::id(self.id)
-            ::
-            .build()
-        self.time_millis()
+    pub fn from_path(file_io: &FileIO, path: &str) -> Snapshot {
+        todo!()
     }
 }
