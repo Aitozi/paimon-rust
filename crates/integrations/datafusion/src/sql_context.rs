@@ -29,6 +29,7 @@
 //! - `ALTER TABLE db.t DROP COLUMN col`
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
 //! - `ALTER TABLE db.t RENAME TO new_name`
+//! - `ALTER TABLE db.t UNSET TBLPROPERTIES ('key', ...)`
 //! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
@@ -340,6 +341,9 @@ impl SQLContext {
         if contains_time_travel_keyword(&rewritten_sql) {
             // Time-travel queries are not DDL; skip our own parsing and handle directly.
             return self.handle_time_travel_query(&rewritten_sql).await;
+        }
+        if let Some(command) = parse_unset_tblproperties(&rewritten_sql)? {
+            return self.handle_unset_tblproperties(command).await;
         }
 
         let statements = Parser::parse_sql(&GenericDialect {}, &rewritten_sql)
@@ -941,6 +945,23 @@ impl SQLContext {
                 .map_err(to_datafusion_error)?;
         }
 
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_unset_tblproperties(
+        &self,
+        command: UnsetTblPropertiesCommand,
+    ) -> DFResult<DataFrame> {
+        let (catalog, _, identifier) = self.resolve_catalog_and_table(&command.name)?;
+        let changes = command
+            .keys
+            .into_iter()
+            .map(SchemaChange::remove_option)
+            .collect();
+        catalog
+            .alter_table(&identifier, changes, command.if_exists)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         ok_result(&self.ctx)
     }
 
@@ -1555,6 +1576,312 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
     rewritten.push_str(&sql[..kw_start]);
     rewritten.push_str(&sql[clause_end..]);
     Ok((rewritten, partition_keys))
+}
+
+#[derive(Debug)]
+struct UnsetTblPropertiesCommand {
+    name: ObjectName,
+    keys: Vec<String>,
+    if_exists: bool,
+}
+
+fn parse_unset_tblproperties(sql: &str) -> DFResult<Option<UnsetTblPropertiesCommand>> {
+    if !looks_like_alter_table(sql) {
+        return Ok(None);
+    }
+    let Some((unset_start, tblproperties_end)) = find_unset_tblproperties(sql) else {
+        return Ok(None);
+    };
+
+    let paren_start = skip_sql_ws_and_comments(sql, tblproperties_end);
+    if !sql[paren_start..].starts_with('(') {
+        return Err(DataFusionError::Plan(
+            "Expected '(' after UNSET TBLPROPERTIES".to_string(),
+        ));
+    }
+    let paren_end = find_matching_paren(sql, paren_start).ok_or_else(|| {
+        DataFusionError::Plan("Unmatched '(' in UNSET TBLPROPERTIES clause".to_string())
+    })?;
+
+    if !has_only_optional_trailing_semicolon(sql, paren_end + 1) {
+        return Err(DataFusionError::Plan(
+            "Unexpected tokens after UNSET TBLPROPERTIES".to_string(),
+        ));
+    }
+
+    let keys = parse_unset_property_keys(&sql[paren_start + 1..paren_end])?;
+    let fake_sql = format!(
+        "{} SET TBLPROPERTIES ('__paimon_dummy__' = '__paimon_dummy__')",
+        sql[..unset_start].trim_end()
+    );
+    let statements = Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| {
+        DataFusionError::Plan(format!("SQL parse error in UNSET TBLPROPERTIES: {e}"))
+    })?;
+
+    let [Statement::AlterTable(alter_table)] = statements.as_slice() else {
+        return Err(DataFusionError::Plan(
+            "UNSET TBLPROPERTIES must be used with ALTER TABLE".to_string(),
+        ));
+    };
+
+    Ok(Some(UnsetTblPropertiesCommand {
+        name: alter_table.name.clone(),
+        keys,
+        if_exists: alter_table.if_exists,
+    }))
+}
+
+fn find_unset_tblproperties(sql: &str) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_sql_quoted(sql, i),
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => i = skip_sql_line_comment(sql, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => i = skip_sql_block_comment(sql, i),
+            _ if keyword_at(sql, i, "UNSET") => {
+                let after_unset = skip_sql_ws_and_comments(sql, i + "UNSET".len());
+                if keyword_at(sql, after_unset, "TBLPROPERTIES") {
+                    return Some((i, after_unset + "TBLPROPERTIES".len()));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn parse_unset_property_keys(inner: &str) -> DFResult<Vec<String>> {
+    let mut keys = Vec::new();
+    for token in split_sql_comma_separated(inner)? {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(DataFusionError::Plan(
+                "Empty key in UNSET TBLPROPERTIES".to_string(),
+            ));
+        }
+        if contains_sql_top_level_equals(trimmed) {
+            return Err(DataFusionError::Plan(
+                "UNSET TBLPROPERTIES accepts keys only, not key-value pairs".to_string(),
+            ));
+        }
+        keys.push(unquote_sql_identifier_or_string(trimmed)?);
+    }
+    if keys.is_empty() {
+        return Err(DataFusionError::Plan(
+            "UNSET TBLPROPERTIES must specify at least one key".to_string(),
+        ));
+    }
+    Ok(keys)
+}
+
+fn split_sql_comma_separated(inner: &str) -> DFResult<Vec<&str>> {
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_sql_quoted(inner, i),
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => i = skip_sql_line_comment(inner, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => i = skip_sql_block_comment(inner, i),
+            b',' => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+                i += 1;
+            }
+            b'(' | b')' => {
+                return Err(DataFusionError::Plan(
+                    "UNSET TBLPROPERTIES keys must be string literals or identifiers".to_string(),
+                ));
+            }
+            _ => i += 1,
+        }
+    }
+    parts.push(&inner[start..]);
+    Ok(parts)
+}
+
+fn contains_sql_top_level_equals(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_sql_quoted(sql, i),
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => i = skip_sql_line_comment(sql, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => i = skip_sql_block_comment(sql, i),
+            b'=' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+fn unquote_sql_identifier_or_string(token: &str) -> DFResult<String> {
+    let Some(quote) = token.chars().next() else {
+        return Err(DataFusionError::Plan(
+            "Empty key in UNSET TBLPROPERTIES".to_string(),
+        ));
+    };
+    if quote == '\'' || quote == '"' || quote == '`' {
+        if !token.ends_with(quote) || token.len() < 2 {
+            return Err(DataFusionError::Plan(format!(
+                "Invalid quoted key in UNSET TBLPROPERTIES: {token}"
+            )));
+        }
+        let inner = &token[quote.len_utf8()..token.len() - quote.len_utf8()];
+        let mut value = String::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == quote {
+                if chars.next_if_eq(&quote).is_some() {
+                    value.push(quote);
+                } else {
+                    return Err(DataFusionError::Plan(format!(
+                        "Invalid quoted key in UNSET TBLPROPERTIES: {token}"
+                    )));
+                }
+            } else {
+                value.push(ch);
+            }
+        }
+        return Ok(value);
+    }
+    Ok(token.to_string())
+}
+
+fn has_only_optional_trailing_semicolon(sql: &str, start: usize) -> bool {
+    let i = skip_sql_ws_and_comments(sql, start);
+    if i == sql.len() {
+        return true;
+    }
+    if sql[i..].starts_with(';') {
+        return skip_sql_ws_and_comments(sql, i + 1) == sql.len();
+    }
+    false
+}
+
+fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0;
+    let mut i = open;
+    while i < len {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_sql_quoted(sql, i),
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => i = skip_sql_line_comment(sql, i),
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => i = skip_sql_block_comment(sql, i),
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_sql_ws_and_comments(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i = skip_sql_line_comment(sql, i);
+            continue;
+        }
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i = skip_sql_block_comment(sql, i);
+            continue;
+        }
+        return i;
+    }
+}
+
+fn skip_sql_quoted(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < len {
+        if bytes[i] == quote {
+            i += 1;
+            if i < len && bytes[i] == quote {
+                i += 1;
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn skip_sql_line_comment(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = start + 2;
+    while i < len && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn skip_sql_block_comment(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = start + 2;
+    while i + 1 < len {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    len
+}
+
+fn keyword_at(sql: &str, start: usize, keyword: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let keyword = keyword.as_bytes();
+    if start + keyword.len() > bytes.len()
+        || !bytes[start..start + keyword.len()].eq_ignore_ascii_case(keyword)
+    {
+        return false;
+    }
+    let before_ok = start == 0 || !is_sql_identifier_byte(bytes[start - 1]);
+    let after = start + keyword.len();
+    let after_ok = after == bytes.len() || !is_sql_identifier_byte(bytes[after]);
+    before_ok && after_ok
+}
+
+fn is_sql_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn looks_like_alter_table(sql: &str) -> bool {
+    let mut i = skip_sql_ws_and_comments(sql, 0);
+    if !keyword_at(sql, i, "ALTER") {
+        return false;
+    }
+    i = skip_sql_ws_and_comments(sql, i + "ALTER".len());
+    if !keyword_at(sql, i, "TABLE") {
+        return false;
+    }
+    true
 }
 
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].
@@ -3207,6 +3534,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_alter_table_unset_tblproperties() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("ALTER TABLE mydb.t1 UNSET TBLPROPERTIES ('bucket', 'file.format')")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable {
+            identifier,
+            changes,
+            ignore_if_not_exists,
+        } = &calls[0]
+        {
+            assert_eq!(identifier.database(), "mydb");
+            assert_eq!(identifier.object(), "t1");
+            assert!(!ignore_if_not_exists);
+            assert_eq!(changes.len(), 2);
+            assert!(matches!(
+                &changes[0],
+                SchemaChange::RemoveOption { key } if key == "bucket"
+            ));
+            assert!(matches!(
+                &changes[1],
+                SchemaChange::RemoveOption { key } if key == "file.format"
+            ));
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_if_exists_unset_tblproperties() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        sql_context
+            .sql("ALTER TABLE IF EXISTS paimon.mydb.t1 UNSET TBLPROPERTIES (`bucket`)")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        assert_eq!(calls.len(), 1);
+        if let CatalogCall::AlterTable {
+            identifier,
+            changes,
+            ignore_if_not_exists,
+        } = &calls[0]
+        {
+            assert_eq!(identifier.database(), "mydb");
+            assert_eq!(identifier.object(), "t1");
+            assert!(ignore_if_not_exists);
+            assert_eq!(changes.len(), 1);
+            assert!(matches!(
+                &changes[0],
+                SchemaChange::RemoveOption { key } if key == "bucket"
+            ));
+        } else {
+            panic!("expected AlterTable call");
+        }
+    }
+
+    #[tokio::test]
     async fn test_alter_table_rename_column() {
         let catalog = Arc::new(MockCatalog::new());
         let sql_context = make_sql_context(catalog.clone()).await;
@@ -3498,6 +3891,53 @@ mod tests {
         let (rewritten, keys) = extract_partition_by(sql).unwrap();
         assert_eq!(keys, vec!["id"]);
         assert!(rewritten.contains("/* PARTITIONED BY (x) */"));
+    }
+
+    // ==================== parse_unset_tblproperties tests ====================
+
+    #[test]
+    fn test_parse_unset_tblproperties() {
+        let command =
+            parse_unset_tblproperties("ALTER TABLE mydb.t UNSET TBLPROPERTIES ('bucket', `k2`)")
+                .unwrap()
+                .unwrap();
+        assert_eq!(object_name_to_string(&command.name), "mydb.t");
+        assert_eq!(command.keys, vec!["bucket", "k2"]);
+        assert!(!command.if_exists);
+    }
+
+    #[test]
+    fn test_parse_unset_tblproperties_if_exists_and_semicolon() {
+        let command = parse_unset_tblproperties(
+            "ALTER TABLE IF EXISTS paimon.mydb.t UnSeT TblProperties ('a'); -- trailing",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(object_name_to_string(&command.name), "paimon.mydb.t");
+        assert_eq!(command.keys, vec!["a"]);
+        assert!(command.if_exists);
+    }
+
+    #[test]
+    fn test_parse_unset_tblproperties_ignores_literals_and_comments() {
+        let sql = "ALTER TABLE mydb.t /* UNSET TBLPROPERTIES ('x') */ \
+                   UNSET TBLPROPERTIES ('unset tblproperties')";
+        let command = parse_unset_tblproperties(sql).unwrap().unwrap();
+        assert_eq!(command.keys, vec!["unset tblproperties"]);
+    }
+
+    #[test]
+    fn test_parse_unset_tblproperties_ignores_non_alter_table() {
+        assert!(parse_unset_tblproperties("SELECT 'UNSET TBLPROPERTIES'")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_parse_unset_tblproperties_rejects_key_value_pairs() {
+        let err = parse_unset_tblproperties("ALTER TABLE mydb.t UNSET TBLPROPERTIES ('a' = 'b')")
+            .unwrap_err();
+        assert!(err.to_string().contains("keys only"));
     }
 
     #[test]

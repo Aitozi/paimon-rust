@@ -538,6 +538,44 @@ async fn test_alter_table_rename() {
 }
 
 #[tokio::test]
+async fn test_alter_table_unset_tblproperties() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.mydb.unset_props (id INT) \
+             WITH ('custom.drop' = 'x', 'custom.keep' = 'y')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    sql_context
+        .sql("ALTER TABLE paimon.mydb.unset_props UNSET TBLPROPERTIES ('custom.drop')")
+        .await
+        .expect("ALTER TABLE UNSET TBLPROPERTIES should succeed");
+
+    let table = catalog
+        .get_table(&Identifier::new("mydb", "unset_props"))
+        .await
+        .unwrap();
+    assert!(
+        !table.schema().options().contains_key("custom.drop"),
+        "custom.drop should be removed"
+    );
+    assert_eq!(
+        table.schema().options().get("custom.keep"),
+        Some(&"y".to_string()),
+        "custom.keep should remain"
+    );
+}
+
+#[tokio::test]
 async fn test_ddl_context_delegates_select() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
